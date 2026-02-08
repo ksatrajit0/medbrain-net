@@ -1,193 +1,373 @@
+############################################
+# ================ IMPORTS =================
+############################################
+
 import os
+import random
+import h5py
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
+import torchvision.transforms.functional as TF
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from tqdm import tqdm
+from scipy import ndimage
+from skimage.morphology import remove_small_objects, closing, disk
+from skimage.measure import label
 from PIL import Image
-from torch.utils.data import DataLoader
-import h5py
 
-# ==========================================
-# 1. CONFIGURATION & HYPERPARAMETERS
-# ==========================================
-CONFIG = {
-    "device": torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-    "n_filters": 32,
-    "deep_supervision": True,
-    "target_size": (240, 240),
-    
-    # Paths
-    "checkpoint_paths": [
-        '/kaggle/input/unetplusplus/pytorch/default/1/best_brain_segmentation_model.pth',
-        '/kaggle/input/unetplusplus2/pytorch/default/1/best_brain_segmentation_model archi 2.pth'
-    ],
-    "ensemble_weights": [0.4, 0.6],
-    "test_image_path": '/kaggle/input/picture/slice1_T1 (2).jpg',
-    "output_dir": "./brain_segmentation_results",
-    
-    # Labels & Colors
-    "tumor_classes": ['NCR', 'ED', 'ET'],
-    "colors": [(0, 0, 1), (0, 1, 0), (1, 0.6, 0)] # Blue, Green, Orange
-}
+############################################
+# ============ DATA INSPECTION =============
+############################################
 
-os.makedirs(CONFIG["output_dir"], exist_ok=True)
+DATA_DIR = "/kaggle/input/brats2020-training-data/BraTS2020_training_data/content/data"
 
-# ==========================================
-# 2. MODEL COMPONENTS (CBAM + UNet++)
-# ==========================================
-class CBAM(nn.Module):
-    def __init__(self, in_channels, reduction=8):
+h5_files = [os.path.join(DATA_DIR, f) for f in os.listdir(DATA_DIR) if f.endswith(".h5")]
+print(f"Found {len(h5_files)} H5 files")
+
+if len(h5_files) > 0:
+    with h5py.File(h5_files[0], 'r') as f:
+        print("Keys:", list(f.keys()))
+        print("Image shape:", f['image'].shape)
+        print("Mask shape:", f['mask'].shape)
+
+############################################
+# ============== AUGMENTATION ==============
+############################################
+
+class BrainScanAugmentation:
+    def __init__(self, p=0.5):
+        self.p = p
+
+    def __call__(self, image, mask):
+        if random.random() < self.p:
+            angle = random.randint(-30, 30)
+            image = TF.rotate(image, angle)
+            mask = TF.rotate(mask, angle)
+
+        if random.random() < self.p:
+            image = TF.hflip(image)
+            mask = TF.hflip(mask)
+
+        if random.random() < self.p:
+            image = TF.vflip(image)
+            mask = TF.vflip(mask)
+
+        if random.random() < self.p:
+            noise = torch.randn_like(image) * random.uniform(0.01, 0.05)
+            image = torch.clamp(image + noise, 0, 1)
+
+        return image, mask
+
+############################################
+# ================ DATASET ================
+############################################
+
+class BrainScanDataset(Dataset):
+    def __init__(self, files, augment=False, patch_based=False, patch_size=128):
+        self.files = files
+        self.augment = augment
+        self.patch_based = patch_based
+        self.patch_size = patch_size
+        self.aug = BrainScanAugmentation()
+
+    def __len__(self):
+        return len(self.files)
+
+    def extract_brain_mask(self, image):
+        thresh = np.percentile(image[0], 10)
+        mask = image[0] > thresh
+        mask = ndimage.binary_fill_holes(mask)
+        return mask
+
+    def standardize(self, image, brain_mask):
+        out = np.zeros_like(image)
+        for c in range(image.shape[0]):
+            vals = image[c][brain_mask]
+            if len(vals) > 0:
+                mean, std = vals.mean(), vals.std()
+                out[c] = (image[c] - mean) / (std + 1e-8)
+        out = np.clip(out, -5, 5)
+        out = (out - out.min()) / (out.max() - out.min() + 1e-8)
+        return out
+
+    def __getitem__(self, idx):
+        with h5py.File(self.files[idx], 'r') as f:
+            image = f['image'][()].transpose(2, 0, 1)
+            mask = f['mask'][()].transpose(2, 0, 1)
+
+        brain_mask = self.extract_brain_mask(image)
+        image = self.standardize(image, brain_mask)
+
+        image = torch.tensor(image, dtype=torch.float32)
+        mask = torch.tensor(mask, dtype=torch.float32)
+
+        if self.augment:
+            image, mask = self.aug(image, mask)
+
+        return image, mask
+
+############################################
+# ========== TRAIN / VAL SPLIT ============
+############################################
+
+random.shuffle(h5_files)
+split = int(0.8 * len(h5_files))
+train_files = h5_files[:split]
+val_files = h5_files[split:]
+
+train_dataset = BrainScanDataset(train_files, augment=True)
+val_dataset = BrainScanDataset(val_files)
+
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4)
+
+############################################
+# ============== MODEL ====================
+############################################
+
+class ChannelAttention(nn.Module):
+    def __init__(self, c, r=8):
         super().__init__()
-        self.ca = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, in_channels // reduction, 1, bias=False),
-            nn.ReLU(True),
-            nn.Conv2d(in_channels // reduction, in_channels, 1, bias=False),
-            nn.Sigmoid()
+        self.fc = nn.Sequential(
+            nn.Conv2d(c, c//r, 1),
+            nn.ReLU(),
+            nn.Conv2d(c//r, c, 1)
         )
-        self.sa = nn.Sequential(
-            nn.Conv2d(2, 1, 7, padding=3, bias=False),
-            nn.Sigmoid()
-        )
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        x = x * self.ca(x)
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        res = torch.cat([avg_out, max_out], dim=1)
-        return x * self.sa(res)
+        return self.sigmoid(
+            self.fc(F.adaptive_avg_pool2d(x, 1)) +
+            self.fc(F.adaptive_max_pool2d(x, 1))
+        )
 
-def conv_block(in_c, out_c, dropout_p=0.2):
+class SpatialAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, 7, padding=3)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg = torch.mean(x, 1, keepdim=True)
+        max_, _ = torch.max(x, 1, keepdim=True)
+        return self.sigmoid(self.conv(torch.cat([avg, max_], 1)))
+
+class CBAM(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.ca = ChannelAttention(c)
+        self.sa = SpatialAttention()
+
+    def forward(self, x):
+        return x * self.ca(x) * self.sa(x)
+
+def conv_block(ic, oc):
     return nn.Sequential(
-        nn.Conv2d(in_c, out_c, 3, padding=1),
-        nn.BatchNorm2d(out_c),
-        nn.LeakyReLU(0.1, inplace=True),
-        nn.Conv2d(out_c, out_c, 3, padding=1),
-        nn.BatchNorm2d(out_c),
-        nn.LeakyReLU(0.1, inplace=True),
-        CBAM(out_c),
-        nn.Dropout2d(dropout_p)
+        nn.Conv2d(ic, oc, 3, padding=1),
+        nn.BatchNorm2d(oc),
+        nn.LeakyReLU(0.1),
+        nn.Conv2d(oc, oc, 3, padding=1),
+        nn.BatchNorm2d(oc),
+        nn.LeakyReLU(0.1),
+        CBAM(oc)
     )
 
-
-
 class UNetPlusPlus(nn.Module):
-    def __init__(self, in_channels=4, out_channels=3, deep_supervision=True, n_filters=32):
+    def __init__(self):
         super().__init__()
-        self.deep_supervision = deep_supervision
-        self.pool = nn.MaxPool2d(2, 2)
+        self.enc1 = conv_block(4, 32)
+        self.enc2 = conv_block(32, 64)
+        self.enc3 = conv_block(64, 128)
+        self.enc4 = conv_block(128, 256)
+
+        self.pool = nn.MaxPool2d(2)
+        self.center = conv_block(256, 512)
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
 
-        self.e1 = conv_block(in_channels, n_filters)
-        self.e2 = conv_block(n_filters, n_filters*2)
-        self.e3 = conv_block(n_filters*2, n_filters*4)
-        self.e4 = conv_block(n_filters*4, n_filters*8)
-        self.center = conv_block(n_filters*8, n_filters*16)
+        self.dec1 = conv_block(32+64, 32)
+        self.dec2 = conv_block(64+128, 64)
+        self.dec3 = conv_block(128+256, 128)
+        self.dec4 = conv_block(256+512, 256)
 
-        self.d4_1 = conv_block(n_filters*8 + n_filters*16, n_filters*8)
-        self.d3_2 = conv_block(n_filters*4 + n_filters*8, n_filters*4)
-        self.d2_3 = conv_block(n_filters*2 + n_filters*4, n_filters*2)
-        self.d1_4 = conv_block(n_filters + n_filters*2, n_filters)
-        
-        self.final = nn.Conv2d(n_filters, out_channels, 1)
+        self.out = nn.Conv2d(32, 3, 1)
 
     def forward(self, x):
-        x1 = self.e1(x); x2 = self.e2(self.pool(x1)); x3 = self.e3(self.pool(x2))
-        x4 = self.e4(self.pool(x3)); ct = self.center(self.pool(x4))
-        
-        x4_1 = self.d4_1(torch.cat([x4, self.up(ct)], 1))
-        x3_2 = self.d3_2(torch.cat([x3, self.up(x4_1)], 1))
-        x2_3 = self.d2_3(torch.cat([x2, self.up(x3_2)], 1))
-        x1_4 = self.d1_4(torch.cat([x1, self.up(x2_3)], 1))
-        
-        return [self.final(x1_4)] if self.deep_supervision else self.final(x1_4)
+        x1 = self.enc1(x)
+        x2 = self.enc2(self.pool(x1))
+        x3 = self.enc3(self.pool(x2))
+        x4 = self.enc4(self.pool(x3))
+        c = self.center(self.pool(x4))
 
-# ==========================================
-# 3. ENSEMBLE, METRICS & HISTORY
-# ==========================================
+        d4 = self.dec4(torch.cat([x4, self.up(c)], 1))
+        d3 = self.dec3(torch.cat([x3, self.up(d4)], 1))
+        d2 = self.dec2(torch.cat([x2, self.up(d3)], 1))
+        d1 = self.dec1(torch.cat([x1, self.up(d2)], 1))
+
+        return self.out(d1)
+
+############################################
+# ================ LOSSES =================
+############################################
+
+class DiceLoss(nn.Module):
+    def forward(self, x, y):
+        x = torch.sigmoid(x).view(-1)
+        y = y.view(-1)
+        inter = (x * y).sum()
+        return 1 - (2*inter + 1) / (x.sum() + y.sum() + 1)
+
+class CombinedLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dice = DiceLoss()
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, x, y):
+        return 0.6*self.dice(x,y) + 0.4*self.bce(x,y)
+
+############################################
+# ============== METRICS ==================
+############################################
+
+def dice_score(pred, target):
+    pred = (torch.sigmoid(pred) > 0.5).float()
+    inter = (pred * target).sum()
+    return (2*inter) / (pred.sum() + target.sum() + 1e-8)
+
+############################################
+# ============= TRAIN LOOP ================
+############################################
+
+def train(model, train_loader, val_loader, device, epochs=30):
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    scaler = GradScaler()
+    crit = CombinedLoss()
+
+    train_losses, val_dices = [], []
+    best = 0
+
+    for e in range(epochs):
+        model.train()
+        epoch_loss = 0
+        for x,y in tqdm(train_loader, desc=f"Epoch {e+1}"):
+            x,y = x.to(device), y.to(device)
+            opt.zero_grad()
+            with autocast():
+                p = model(x)
+                loss = crit(p,y)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            epoch_loss += loss.item()
+
+        train_losses.append(epoch_loss/len(train_loader))
+        d = validate(model, val_loader, device)
+        val_dices.append(d)
+
+        print(f"Epoch {e+1}: loss={train_losses[-1]:.4f}, dice={d:.4f}")
+
+        if d > best:
+            best = d
+            torch.save({'model_state_dict': model.state_dict()}, "best_model.pth")
+
+    return train_losses, val_dices
+
+def validate(model, loader, device):
+    model.eval()
+    d = 0
+    with torch.no_grad():
+        for x,y in loader:
+            x,y = x.to(device), y.to(device)
+            d += dice_score(model(x), y)
+    return d / len(loader)
+
+############################################
+# ============ TRAIN PLOTS ================
+############################################
+
+def plot_history(losses, dices):
+    plt.figure(figsize=(12,4))
+    plt.subplot(1,2,1)
+    plt.plot(losses)
+    plt.title("Training Loss")
+
+    plt.subplot(1,2,2)
+    plt.plot(dices)
+    plt.title("Validation Dice")
+    plt.show()
+
+############################################
+# ============ ENSEMBLE ===================
+############################################
+
 class BrainSegmentationEnsemble(nn.Module):
     def __init__(self, paths, weights, device):
         super().__init__()
-        self.models = nn.ModuleList()
+        self.models = []
         self.weights = weights
-        for path in paths:
-            m = UNetPlusPlus(n_filters=CONFIG["n_filters"], deep_supervision=CONFIG["deep_supervision"])
-            ckpt = torch.load(path, map_location=device)
-            m.load_state_dict(ckpt['model_state_dict'])
-            m.to(device).eval()
+        for p in paths:
+            m = UNetPlusPlus().to(device)
+            m.load_state_dict(torch.load(p)['model_state_dict'])
+            m.eval()
             self.models.append(m)
 
     def forward(self, x):
-        all_preds = []
-        for model in self.models:
-            p = model(x)[-1] if CONFIG["deep_supervision"] else model(x)
-            # TTA logic (Horizontal & Vertical Flips)
-            p_h = torch.flip(model(torch.flip(x, [3]))[-1 if CONFIG["deep_supervision"] else None], [3])
-            p_v = torch.flip(model(torch.flip(x, [2]))[-1 if CONFIG["deep_supervision"] else None], [2])
-            all_preds.append((p + p_h + p_v) / 3.0)
-        return sum(w * pred for w, pred in zip(self.weights, all_preds)) / sum(self.weights)
+        preds = []
+        for m in self.models:
+            p0 = m(x)
+            p1 = torch.flip(m(torch.flip(x,[3])),[3])
+            p2 = torch.flip(m(torch.flip(x,[2])),[2])
+            preds.append((p0+p1+p2)/3)
+        out = sum(w*p for w,p in zip(self.weights,preds))
+        return out / sum(self.weights)
 
-def dice_coef(y_true, y_pred, epsilon=1e-6):
-    y_true_f = y_true.flatten()
-    y_pred_f = (torch.sigmoid(y_pred) > 0.5).float().flatten()
-    intersection = (y_true_f * y_pred_f).sum()
-    return (2. * intersection + epsilon) / (y_true_f.sum() + y_pred_f.sum() + epsilon)
+############################################
+# ============= VISUALIZATION =============
+############################################
 
-def plot_history(history):
-    plt.figure(figsize=(15, 5))
-    plt.subplot(1, 2, 1)
-    if 'train_loss' in history: plt.plot(history['train_loss'], label='Train Loss')
-    if 'val_loss' in history: plt.plot(history['val_loss'], label='Val Loss')
-    plt.title('Loss History'); plt.legend(); plt.grid(True)
-    
-    plt.subplot(1, 2, 2)
-    for m in ['dice', 'iou', 'acc']:
-        if f'val_{m}' in history: plt.plot(history[f'val_{m}'], label=f'Val {m.upper()}')
-    plt.title('Metric History'); plt.legend(); plt.grid(True)
-    plt.savefig(f"{CONFIG['output_dir']}/training_history.png")
+def visualize(image, pred):
+    img = image[0,0].cpu()
+    pred = (torch.sigmoid(pred)[0] > 0.5).cpu()
+
+    overlay = np.zeros((*img.shape,3))
+    overlay[pred[0]>0] = [0,0,1]
+    overlay[pred[1]>0] = [0,1,0]
+    overlay[pred[2]>0] = [1,0.6,0]
+
+    plt.imshow(img, cmap='gray')
+    plt.imshow(overlay, alpha=0.5)
+    plt.axis('off')
     plt.show()
 
-# ==========================================
-# 4. MAIN EXECUTION (INFERENCE & VISUALS)
-# ==========================================
+############################################
+# ================= MAIN ==================
+############################################
+
 def main():
-    print(f"Using Device: {CONFIG['device']}")
-    
-    # 1. Load Ensemble
-    ensemble = BrainSegmentationEnsemble(CONFIG["checkpoint_paths"], CONFIG["ensemble_weights"], CONFIG["device"])
-    print("Ensemble Models Loaded.")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = UNetPlusPlus().to(device)
 
-    # 2. Preprocess
-    img = Image.open(CONFIG["test_image_path"]).convert('L').resize(CONFIG["target_size"])
-    img_np = np.array(img).astype(np.float32) / 255.0
-    input_tensor = torch.from_numpy(np.stack([img_np]*4)).unsqueeze(0).to(CONFIG["device"])
+    losses, dices = train(model, train_loader, val_loader, device)
+    plot_history(losses, dices)
 
-    # 3. Inference
+    ensemble = BrainSegmentationEnsemble(
+        ["best_model.pth"],
+        [1.0],
+        device
+    )
+
+    x,y = next(iter(val_loader))
+    x = x.to(device)
+
     with torch.no_grad():
-        output = ensemble(input_tensor)
-        mask = (torch.sigmoid(output) > 0.5).cpu().numpy()[0]
+        p = ensemble(x)
 
-    # 4. Visualization (MRI + 3 Classes + Combined)
-    fig, axes = plt.subplots(1, 5, figsize=(20, 6))
-    axes[0].imshow(img_np, cmap='gray'); axes[0].axis('off'); axes[0].set_title("Original MRI")
-    
-    combined = np.zeros((*CONFIG["target_size"], 3))
-    for i in range(3):
-        overlay = np.zeros((*CONFIG["target_size"], 3))
-        overlay[mask[i] > 0] = CONFIG["colors"][i]
-        combined[mask[i] > 0] = CONFIG["colors"][i]
-        axes[i+1].imshow(img_np, cmap='gray')
-        axes[i+1].imshow(overlay, alpha=0.5)
-        axes[i+1].set_title(CONFIG["tumor_classes"][i]); axes[i+1].axis('off')
-        
-    axes[4].imshow(img_np, cmap='gray')
-    axes[4].imshow(combined, alpha=0.5)
-    axes[4].set_title("Full Segmentation"); axes[4].axis('off')
-    
-    plt.savefig(f"{CONFIG['output_dir']}/final_prediction.png")
-    plt.show()
-    print(f"Results saved to {CONFIG['output_dir']}")
+    visualize(x, p)
 
 if __name__ == "__main__":
     main()
