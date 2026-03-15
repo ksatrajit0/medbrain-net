@@ -96,8 +96,15 @@ def main():
     run_training(model_instance, train_loader, val_loader, DEVICE)
 
     print("\n[INFERENCE] Executing Ensemble + TTA Pipeline...")
-    checkpoint_path = "medbrain_final.pth" 
-    ensemble = MedBrainEnsemble([checkpoint_path, checkpoint_path], DEVICE, weights=[0.4, 0.6])
+    checkpoint_paths = [
+    "medbrain_run1.pth",
+    "medbrain_run2.pth",
+    "medbrain_run3.pth"
+    ]
+    
+    weights = [0.33, 0.33, 0.34]
+    
+    ensemble = MedBrainEnsemble(checkpoint_paths, DEVICE, weights=weights)
 
     sample_img, _ = next(iter(val_loader))
     sample_img = sample_img.to(DEVICE)
