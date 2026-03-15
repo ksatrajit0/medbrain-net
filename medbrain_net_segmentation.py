@@ -5,7 +5,7 @@ import numpy as np
 import albumentations as A
 from torch.utils.data import Dataset, DataLoader
 from albumentations.pytorch import ToTensorV2
-from segementation_model import UNetPlusPlus
+from segmentation_model import UNetPlusPlus
 from segmentation_training import run_training
 from segmentation_inference import MedBrainEnsemble, postprocess_and_plot
 
